@@ -800,6 +800,13 @@ class SegCoverageProblemItem(BaseModel):
     source_sop_instance_uid: Optional[str] = Field(
         default=None, description="源图像级问题对应的匿名源 SOPInstanceUID"
     )
+    source_sop_instance_uids: list[str] = Field(
+        default=[],
+        description=(
+            "multiple_source_references 时给出该帧引用的全部不同匿名源 "
+            "SOPInstanceUID（去重、按字典序排列）"
+        ),
+    )
     source_output_file: Optional[str] = Field(
         default=None, description="源图像在任务 output 目录内的扁平文件名"
     )
@@ -817,6 +824,9 @@ class SegCoverageProblemItem(BaseModel):
             "pixel_decode_failed（像素数据截断/无法解码） | "
             "missing_segment_number（帧缺少有效 ReferencedSegmentNumber） | "
             "missing_source_reference（帧缺少源图像引用） | "
+            "multiple_source_references（同一帧在 DerivationImageSequence/"
+            "SourceImageSequence 中引用两个及以上不同匿名 SOP UID，"
+            "无法唯一确定源图像） | "
             "source_not_in_output（引用的源图像不在成功输出中） | "
             "source_ambiguous_output（源图像对应多份输出） | "
             "source_output_missing（源图像磁盘缺失） | "

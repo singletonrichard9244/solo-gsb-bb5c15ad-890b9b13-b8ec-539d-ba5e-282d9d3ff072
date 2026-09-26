@@ -82,6 +82,36 @@ def _fg_item(seg_num=_ABSENT, source_uid=_ABSENT) -> Dataset:
     return item
 
 
+def _fg_item_sources(seg_num, deriv_sources) -> Dataset:
+    """逐帧功能组项，可写多个 DerivationImageSequence/SourceImageSequence。
+
+    deriv_sources 为每个 DerivationImageSequence 项一个列表，列表元素是该
+    SourceImageSequence 各项引用的源 UID（None 表示空 ReferencedSOPInstanceUID）；
+    deriv_sources=_ABSENT 时不写 DerivationImageSequence。
+    """
+    item = Dataset()
+    if deriv_sources is not _ABSENT:
+        derivations = []
+        for source_uids in deriv_sources:
+            deriv = Dataset()
+            srcs = []
+            for uid in source_uids:
+                src = Dataset()
+                src.ReferencedSOPClassUID = CTImageStorage
+                if uid is not None:
+                    src.ReferencedSOPInstanceUID = uid
+                srcs.append(src)
+            deriv.SourceImageSequence = srcs
+            derivations.append(deriv)
+        item.DerivationImageSequence = derivations
+    if seg_num is not _ABSENT:
+        sid = Dataset()
+        if seg_num is not None:
+            sid.ReferencedSegmentNumber = seg_num
+        item.SegmentIdentificationSequence = [sid]
+    return item
+
+
 def _pack_frames(frames_pixels: list[list[int]], rows: int, columns: int) -> bytes:
     """把每帧的前景像素下标列表打包为 DICOM 1-bit（LSB 优先）字节流。"""
     bits = []
@@ -836,6 +866,133 @@ def test_seg_coverage_response_contains_only_anonymized_uids(client):
     raw = str(detail)
     assert "9.9.9" not in raw
     assert _anon("9.9.9") in raw
+
+
+# --------------------------------------------------------------------------- #
+# 409：同一帧引用多个不同源 SOP UID（多源分割不得静默归给首个引用）
+# --------------------------------------------------------------------------- #
+def test_seg_coverage_two_derivations_two_sources_409(client):
+    # 同一帧在两个 DerivationImageSequence 项中分别引用 CT1 与 CT2：
+    # 旧逻辑只读 [0]/[0] 会把该帧静默算作 CT1 的覆盖率
+    detail = _conflict(client, {
+        "ct1.dcm": _ct_image_bytes(CT1_SOP),
+        "ct2.dcm": _ct_image_bytes(CT2_SOP),
+        "seg.dcm": _seg_bytes(
+            frames=[_fg_item_sources(1, [[CT1_SOP], [CT2_SOP]])],
+            frames_pixels=[[0]],
+        ),
+    })
+    problems = [
+        p for p in detail["problems"]
+        if p["reason"] == "multiple_source_references"
+    ]
+    assert len(problems) == 1
+    p = problems[0]
+    assert p["frame_index"] == 0
+    assert p["source_sop_instance_uids"] == sorted(
+        [_anon(CT1_SOP), _anon(CT2_SOP)]
+    )
+    # 不回显原始 UID
+    assert CT1_SOP not in str(detail)
+    assert CT2_SOP not in str(detail)
+    # 不输出部分统计
+    assert "groups" not in detail
+
+
+def test_seg_coverage_two_sources_in_one_source_sequence_409(client):
+    # 单个 DerivationImageSequence 的 SourceImageSequence 内两个不同源
+    detail = _conflict(client, {
+        "ct1.dcm": _ct_image_bytes(CT1_SOP),
+        "ct2.dcm": _ct_image_bytes(CT2_SOP),
+        "seg.dcm": _seg_bytes(
+            frames=[_fg_item_sources(1, [[CT1_SOP, CT2_SOP]])],
+            frames_pixels=[[0]],
+        ),
+    })
+    problems = [
+        p for p in detail["problems"]
+        if p["reason"] == "multiple_source_references"
+    ]
+    assert len(problems) == 1
+    assert problems[0]["frame_index"] == 0
+    assert problems[0]["source_sop_instance_uids"] == sorted(
+        [_anon(CT1_SOP), _anon(CT2_SOP)]
+    )
+
+
+def test_seg_coverage_multiple_conflicting_frames_listed_together(client):
+    # 第 0 帧与第 2 帧各引用两个不同源 UID，第 1 帧正常：
+    # 同一次 409 必须汇总全部冲突帧号与冲突 UID，不输出部分统计
+    detail = _conflict(client, {
+        "ct1.dcm": _ct_image_bytes(CT1_SOP),
+        "ct2.dcm": _ct_image_bytes(CT2_SOP),
+        "seg.dcm": _seg_bytes(
+            frames=[
+                _fg_item_sources(1, [[CT1_SOP], [CT2_SOP]]),
+                _fg_item(1, CT1_SOP),
+                _fg_item_sources(2, [[CT2_SOP, CT1_SOP]]),
+            ],
+            frames_pixels=[[0], [1], [2]],
+        ),
+    })
+    problems = [
+        p for p in detail["problems"]
+        if p["reason"] == "multiple_source_references"
+    ]
+    assert [p["frame_index"] for p in problems] == [0, 2]
+    for p in problems:
+        assert p["source_sop_instance_uids"] == sorted(
+            [_anon(CT1_SOP), _anon(CT2_SOP)]
+        )
+    assert detail["conflict_count"] == len(detail["problems"]) == 2
+    assert "groups" not in detail
+
+
+def test_seg_coverage_duplicate_same_uid_across_sequences_is_single_source(client):
+    # 同一 UID 在不同 DerivationImageSequence/SourceImageSequence 中重复出现：
+    # 去重后恰有一个唯一 UID，结果与单一引用完全一致（顺序与数值不变）
+    files = {
+        "ct1.dcm": _ct_image_bytes(CT1_SOP),
+        "seg.dcm": _seg_bytes(
+            frames=[
+                _fg_item_sources(1, [[CT1_SOP], [CT1_SOP, CT1_SOP]]),
+                _fg_item(1, CT1_SOP),
+            ],
+            frames_pixels=[[0], [1]],
+        ),
+    }
+    job = _upload(client, files)
+    r = _seg_coverage(client, job["id"])
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["group_count"] == 1
+    group = data["groups"][0]
+    assert group["source_sop_instance_uid"] == _anon(CT1_SOP)
+    assert group["segment_number"] == 1
+    assert group["frame_count"] == 2
+    assert group["foreground_pixels"] == 2
+    assert group["coverage"] == pytest.approx(2 / 16)
+
+
+def test_seg_coverage_multi_source_conflict_checks_before_source_lookup(client):
+    # 冲突 UID 即使不在任务输出中，也先按同帧多源冲突报告（不静默归给首个引用）
+    detail = _conflict(client, {
+        "ct1.dcm": _ct_image_bytes(CT1_SOP),
+        "ct2.dcm": _ct_image_bytes(CT2_SOP),
+        "seg.dcm": _seg_bytes(
+            frames=[_fg_item_sources(1, [[CT1_SOP], ["9.9.9"]])],
+            frames_pixels=[[0]],
+        ),
+    })
+    reasons = {p["reason"] for p in detail["problems"]}
+    assert "multiple_source_references" in reasons
+    problems = [
+        p for p in detail["problems"]
+        if p["reason"] == "multiple_source_references"
+    ]
+    assert problems[0]["source_sop_instance_uids"] == sorted(
+        [_anon(CT1_SOP), _anon("9.9.9")]
+    )
 
 
 # --------------------------------------------------------------------------- #

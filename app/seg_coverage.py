@@ -11,10 +11,13 @@
   Explicit VR Big Endian）、1-bit 位深
   （BitsAllocated=BitsStored=1、HighBit=0）；
 * 逐帧读取 ``PerFrameFunctionalGroupsSequence[i]``：
-  ``SegmentIdentificationSequence[0].ReferencedSegmentNumber`` 给出段号，
-  ``DerivationImageSequence[0].SourceImageSequence[0].ReferencedSOPInstanceUID``
-  给出源图像的匿名 SOP UID（匿名化已把序列内引用与源实例一致重写，
-  因此可直接与任务成功输出对齐）；
+  ``SegmentIdentificationSequence[0].ReferencedSegmentNumber`` 给出段号；
+  遍历该帧**全部** ``DerivationImageSequence`` 项及其**全部**
+  ``SourceImageSequence`` 项，收集 ``ReferencedSOPInstanceUID``（匿名化已把
+  序列内引用与源实例一致重写，因此可直接与任务成功输出对齐）并按匿名 SOP UID
+  去重——恰有一个唯一 UID 时该帧归属对应源图像；同一帧出现两个及以上不同
+  UID（如多源分割）时无法判定唯一归属，记 ``multiple_source_references`` 冲突，
+  不静默归给首个引用；
 * 源图像必须在任务成功输出中**唯一**，且其 Rows/Columns 与 SEG 掩码一致；
 * 解码 1-bit 掩码，同一（源图像, 段号）的多帧逐像素取**并集**，
   统计前景像素数、图像像素数（源图像 Rows × Columns）与覆盖率，
@@ -35,7 +38,8 @@
   （``frame_count_mismatch``）；
 * 帧缺少有效 ReferencedSegmentNumber（``missing_segment_number``）或缺少
   DerivationImageSequence/SourceImageSequence 引用
-  （``missing_source_reference``）；
+  （``missing_source_reference``）；同一帧引用两个及以上不同匿名 SOP UID
+  （``multiple_source_references``，逐帧给出冲突 UID 列表）；
 * 引用的源图像不在任务成功输出中（``source_not_in_output``）、对应多份输出
   （``source_ambiguous_output``）、磁盘缺失（``source_output_missing``）、
   不可读或缺少有效尺寸（``source_unreadable``）、尺寸与掩码不一致
@@ -83,6 +87,7 @@ REASON_MISSING_PIXEL_DATA = "missing_pixel_data"
 REASON_PIXEL_DECODE_FAILED = "pixel_decode_failed"
 REASON_MISSING_SEGMENT_NUMBER = "missing_segment_number"
 REASON_MISSING_SOURCE_REFERENCE = "missing_source_reference"
+REASON_MULTIPLE_SOURCE_REFERENCES = "multiple_source_references"
 REASON_SOURCE_NOT_IN_OUTPUT = "source_not_in_output"
 REASON_SOURCE_AMBIGUOUS_OUTPUT = "source_ambiguous_output"
 REASON_SOURCE_OUTPUT_MISSING = "source_output_missing"
@@ -183,17 +188,28 @@ def _frame_segment_number(fg_item) -> Optional[int]:
     return _positive_int(getattr(seq[0], "ReferencedSegmentNumber", None))
 
 
-def _frame_source_uid(fg_item) -> Optional[str]:
-    """逐帧功能组 -> DerivationImageSequence[0] -> SourceImageSequence[0]
-    -> ReferencedSOPInstanceUID（匿名化后已与源实例输出一致）。"""
+def _frame_source_uids(fg_item) -> list[str]:
+    """收集逐帧功能组中全部源图像引用的匿名 SOP UID（已去重、按字典序排列）。
+
+    遍历**所有** DerivationImageSequence 项及其**所有** SourceImageSequence 项
+    的 ReferencedSOPInstanceUID，而不是只读 [0]/[0]：同一帧引用两个不同匿名
+    SOP UID（多源分割）时由调用方按 multiple_source_references 拒绝。
+    没有任何非空引用时返回空列表（对应 missing_source_reference）。
+    """
+    uids: set[str] = set()
     deriv = getattr(fg_item, "DerivationImageSequence", None)
-    if not deriv:
-        return None
-    src = getattr(deriv[0], "SourceImageSequence", None)
-    if not src:
-        return None
-    uid = str(getattr(src[0], "ReferencedSOPInstanceUID", "") or "").strip()
-    return uid or None
+    if deriv:
+        for deriv_item in deriv:
+            src_seq = getattr(deriv_item, "SourceImageSequence", None)
+            if not src_seq:
+                continue
+            for src_item in src_seq:
+                uid = str(
+                    getattr(src_item, "ReferencedSOPInstanceUID", "") or ""
+                ).strip()
+                if uid:
+                    uids.add(uid)
+    return sorted(uids)
 
 
 # --------------------------------------------------------------------------- #
@@ -512,6 +528,9 @@ def analyze_seg_coverage(job, sop_uid: str) -> dict:
     masks = arr != 0
 
     # ---- 逐帧提取（段号, 源图像匿名 UID） ---------------------------------- #
+    # 逐帧遍历全部 DerivationImageSequence/SourceImageSequence 引用并按匿名
+    # SOP UID 去重：恰有一个唯一 UID 时该帧归属该源图像；同一帧引用多个不同
+    # UID 时记 multiple_source_references，不静默归给第一张源图像。
     # (frame_index, segment_number, source_sop_instance_uid)
     frame_refs: list[tuple[int, int, str]] = []
     for frame_index in range(frames):
@@ -527,8 +546,8 @@ def analyze_seg_coverage(job, sop_uid: str) -> dict:
                     "SegmentIdentificationSequence/ReferencedSegmentNumber"
                 ),
             })
-        source_uid = _frame_source_uid(fg_item)
-        if source_uid is None:
+        source_uids = _frame_source_uids(fg_item)
+        if not source_uids:
             problems.append({
                 **base,
                 "frame_index": frame_index,
@@ -538,8 +557,22 @@ def analyze_seg_coverage(job, sop_uid: str) -> dict:
                     "SourceImageSequence 的 ReferencedSOPInstanceUID 引用"
                 ),
             })
-        if seg_num is not None and source_uid is not None:
-            frame_refs.append((frame_index, seg_num, source_uid))
+        elif len(source_uids) > 1:
+            problems.append({
+                **base,
+                "frame_index": frame_index,
+                "reason": REASON_MULTIPLE_SOURCE_REFERENCES,
+                "source_sop_instance_uids": source_uids,
+                "message": (
+                    f"帧 {frame_index} 在 DerivationImageSequence/"
+                    "SourceImageSequence 中引用了多个不同的源图像匿名 "
+                    f"SOP UID（{len(source_uids)} 个），无法唯一确定该帧的"
+                    "源图像，拒绝把该帧静默归给首个引用："
+                    f"{', '.join(source_uids)}"
+                ),
+            })
+        elif seg_num is not None:
+            frame_refs.append((frame_index, seg_num, source_uids[0]))
 
     # ---- 解析被引用源图像（唯一、可读、尺寸一致） -------------------------- #
     index: dict[str, list[FileReport]] = {}

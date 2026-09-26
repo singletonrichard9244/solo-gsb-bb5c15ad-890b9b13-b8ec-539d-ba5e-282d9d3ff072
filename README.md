@@ -86,7 +86,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/jobs/{job_id}/series/{series_instance_uid}/kvp` | 按**匿名 SeriesInstanceUID** 统计 CT 管电压（KVP）逐帧分布：各电压帧数、缺失帧数与按匿名 SOP UID 排列的逐实例明细，便于发现同系列混用扫描参数 |
 | `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/preview.png` | 按**匿名 SOPInstanceUID** 返回实例影像的 8 位灰度 **PNG 预览**（未压缩、单帧、8/16 位 MONOCHROME1/2），供人工核对影像内容 |
 | `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/dose-events` | 按**匿名 SOPInstanceUID** 解析 **X-Ray Radiation Dose SR**：递归遍历 ContentSequence，按 DCM 编码的 CT 照射事件容器提取逐事件 CTDIvol（mGy）/ DLP（mGy·cm）并给出事件 DLP 合计；事件数据缺项/重复/非法/单位不符返回 `409` |
-| `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/seg-coverage` | 按**匿名 SOPInstanceUID** 统计**未压缩 BINARY SEG** 的分割覆盖率：逐帧用 `ReferencedSegmentNumber` 与 `DerivationImageSequence/SourceImageSequence` 的匿名引用关联任务内唯一源图像，同（源图像, 段号）多帧 1-bit 掩码逐像素并集，返回前景像素数/图像像素数/覆盖率；引用缺失/歧义、尺寸不一致、帧数或像素数据异常返回 `409` |
+| `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/seg-coverage` | 按**匿名 SOPInstanceUID** 统计**未压缩 BINARY SEG** 的分割覆盖率：逐帧用 `ReferencedSegmentNumber` 与**全部** `DerivationImageSequence/SourceImageSequence` 的匿名引用（按匿名 SOP UID 去重）关联任务内唯一源图像，同（源图像, 段号）多帧 1-bit 掩码逐像素并集，返回前景像素数/图像像素数/覆盖率；引用缺失、**同一帧引用多个不同源 UID**、引用歧义、尺寸不一致、帧数或像素数据异常返回 `409` |
 | `GET` | `/health` | 健康检查 |
 
 ### 表单参数（`POST /jobs`）
@@ -820,10 +820,18 @@ else:
 **统计规则**：
 
 1. 逐帧读取 `PerFrameFunctionalGroupsSequence[i]`：
-   `SegmentIdentificationSequence[0].ReferencedSegmentNumber` 给出**段号**，
-   `DerivationImageSequence[0].SourceImageSequence[0].ReferencedSOPInstanceUID`
-   给出**源图像的匿名 SOP UID**（匿名化已把序列内引用与源实例一致重写，
-   因此可直接对齐任务成功输出）；
+   `SegmentIdentificationSequence[0].ReferencedSegmentNumber` 给出**段号**；
+   遍历该帧**全部** `DerivationImageSequence` 项及其**全部**
+   `SourceImageSequence` 项，收集 `ReferencedSOPInstanceUID`
+   （匿名化已把序列内引用与源实例一致重写，因此可直接对齐任务成功输出）并按
+   匿名 SOP UID **去重**：
+   - 恰有一个唯一 UID 时，该帧归属对应源图像，沿用唯一源图像校验与掩码并集；
+   - **同一帧引用两个及以上不同匿名 SOP UID**（例如多源分割：不同
+     DerivationImageSequence 项，或同一 SourceImageSequence 内多个源项）时，
+     无法唯一确定该帧归属，接口返回 `409`（`multiple_source_references`，
+     逐帧给出冲突 UID 列表），**不会静默把该帧归给第一个引用**；
+   - 完全没有源引用（缺 DerivationImageSequence / SourceImageSequence /
+     ReferencedSOPInstanceUID）时返回 `409`（`missing_source_reference`）；
 2. 每个被引用的源图像必须**唯一**对应任务内一份成功输出，且其
    `Rows/Columns` 与 SEG 掩码一致（只读取源图像像素之前的标签，不解码源像素）；
 3. 解码 1-bit 掩码，把**同一（源图像, 段号）** 的多帧**逐像素取并集**
@@ -893,6 +901,7 @@ curl -f "http://localhost:8000/jobs/$JOB_ID/instances/$SEG_UID/seg-coverage" | p
 | `pixel_decode_failed` | 像素数据截断或与元数据不符，1-bit 掩码无法解码 |
 | `missing_segment_number` | 帧缺少有效 `ReferencedSegmentNumber` |
 | `missing_source_reference` | 帧缺少 `DerivationImageSequence`/`SourceImageSequence` 引用 |
+| `multiple_source_references` | 同一帧在全部 `DerivationImageSequence`/`SourceImageSequence` 中引用了**两个及以上不同**匿名 SOP UID（多源分割；`frame_index` 给出帧号，`source_sop_instance_uids` 给出去重后的冲突 UID 列表）。此情况下无法唯一确定该帧归属的源图像，整份统计返回 409 且不输出部分结果，避免把帧静默归给首个引用而算出错误覆盖率 |
 | `source_not_in_output` | 帧引用的源图像匿名 SOP UID 不在任务成功输出中（引用缺失） |
 | `source_ambiguous_output` | 源图像匿名 SOP UID 对应多份输出（`output_files` 列出冲突文件，引用歧义） |
 | `source_output_missing` | 源图像输出文件在任务目录中已不存在 |

@@ -809,7 +809,7 @@ def get_instance_dose_events(job_id: str, sop_instance_uid: str) -> DoseEventsOu
         409: {"model": SegCoverageErrorDetail,
               "description": "任务未完成、同一匿名 SOP UID 对应多份输出，或 SEG 统计冲突："
                              "非 Segmentation/非 BINARY/压缩传输语法、帧数或像素数据异常、"
-                             "源图像引用缺失/歧义/尺寸不一致（不输出部分统计）"},
+                             "源图像引用缺失/一帧多源冲突/歧义/尺寸不一致（不输出部分统计）"},
     },
 )
 def get_instance_seg_coverage(job_id: str, sop_instance_uid: str) -> SegCoverageOut:

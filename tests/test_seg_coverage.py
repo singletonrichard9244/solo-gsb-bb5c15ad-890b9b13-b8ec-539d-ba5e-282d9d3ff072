@@ -82,6 +82,30 @@ def _fg_item(seg_num=_ABSENT, source_uid=_ABSENT) -> Dataset:
     return item
 
 
+def _src_ref(source_uid: str) -> Dataset:
+    """SourceImageSequence 条目：引用指定 SOP UID 的 CT 源图像。"""
+    src = Dataset()
+    src.ReferencedSOPClassUID = CTImageStorage
+    src.ReferencedSOPInstanceUID = source_uid
+    return src
+
+
+def _fg_item_multi(seg_num: int, derivations: list[list[str]]) -> Dataset:
+    """逐帧功能组项：derivations 外层对应 DerivationImageSequence 各条目，
+    内层对应该条目 SourceImageSequence 引用的源 SOP UID 列表。"""
+    item = Dataset()
+    sid = Dataset()
+    sid.ReferencedSegmentNumber = seg_num
+    item.SegmentIdentificationSequence = [sid]
+    deriv_items = []
+    for source_uids in derivations:
+        deriv = Dataset()
+        deriv.SourceImageSequence = [_src_ref(uid) for uid in source_uids]
+        deriv_items.append(deriv)
+    item.DerivationImageSequence = deriv_items
+    return item
+
+
 def _pack_frames(frames_pixels: list[list[int]], rows: int, columns: int) -> bytes:
     """把每帧的前景像素下标列表打包为 DICOM 1-bit（LSB 优先）字节流。"""
     bits = []
@@ -354,6 +378,33 @@ def test_seg_coverage_only_requested_instance_parsed(client):
     data = _seg_coverage(client, job["id"], SEG_SOP).json()
     assert data["sop_instance_uid"] == _anon(SEG_SOP)
     assert data["groups"][0]["foreground_pixels"] == 1
+
+
+def test_seg_coverage_duplicate_same_source_reference_ok(client):
+    # 一帧含多个 DerivationImageSequence 条目、且条目内多个 SourceImageSequence
+    # 条目，但去重后只有同一个源图像 UID：与单一引用结果完全一致
+    files = {
+        "ct1.dcm": _ct_image_bytes(CT1_SOP),
+        "seg.dcm": _seg_bytes(
+            frames=[
+                _fg_item_multi(1, [[CT1_SOP, CT1_SOP], [CT1_SOP]]),
+                _fg_item(1, CT1_SOP),
+            ],
+            frames_pixels=[[0, 1], [1, 2]],
+        ),
+    }
+    job = _upload(client, files)
+    r = _seg_coverage(client, job["id"])
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["group_count"] == 1
+    group = data["groups"][0]
+    assert group["source_sop_instance_uid"] == _anon(CT1_SOP)
+    assert group["segment_number"] == 1
+    assert group["frame_count"] == 2
+    assert group["foreground_pixels"] == 3   # 并集 {0,1,2}
+    assert group["image_pixels"] == 16
+    assert group["coverage"] == pytest.approx(3 / 16)
 
 
 # --------------------------------------------------------------------------- #
@@ -689,6 +740,97 @@ def test_seg_coverage_missing_source_reference_409(client):
     ]
     assert len(problems) == 1
     assert problems[0]["frame_index"] == 0
+
+
+def test_seg_coverage_conflicting_derivation_items_409(client):
+    # 一帧含两个 DerivationImageSequence 条目，分别引用 CT1 与 CT2：
+    # 不得静默归给首张图像，整体 409 且不输出部分统计
+    detail = _conflict(client, {
+        "ct1.dcm": _ct_image_bytes(CT1_SOP),
+        "ct2.dcm": _ct_image_bytes(CT2_SOP),
+        "seg.dcm": _seg_bytes(
+            frames=[_fg_item_multi(1, [[CT1_SOP], [CT2_SOP]])],
+            frames_pixels=[[0]],
+        ),
+    })
+    problems = [
+        p for p in detail["problems"]
+        if p["reason"] == "conflicting_source_references"
+    ]
+    assert len(problems) == 1
+    p = problems[0]
+    assert p["frame_index"] == 0
+    assert p["sop_instance_uid"] == _anon(SEG_SOP)
+    assert p["source_sop_instance_uids"] == sorted(
+        [_anon(CT1_SOP), _anon(CT2_SOP)]
+    )
+    # 绝不回显原始 SOP UID
+    assert CT1_SOP not in str(detail)
+    assert CT2_SOP not in str(detail)
+
+
+def test_seg_coverage_conflicting_source_image_items_409(client):
+    # 同一 DerivationImageSequence 条目内 SourceImageSequence 引用两个不同源图像
+    detail = _conflict(client, {
+        "ct1.dcm": _ct_image_bytes(CT1_SOP),
+        "ct2.dcm": _ct_image_bytes(CT2_SOP),
+        "seg.dcm": _seg_bytes(
+            frames=[_fg_item_multi(1, [[CT1_SOP, CT2_SOP]])],
+            frames_pixels=[[0]],
+        ),
+    })
+    problems = [
+        p for p in detail["problems"]
+        if p["reason"] == "conflicting_source_references"
+    ]
+    assert len(problems) == 1
+    assert problems[0]["frame_index"] == 0
+    assert problems[0]["source_sop_instance_uids"] == sorted(
+        [_anon(CT1_SOP), _anon(CT2_SOP)]
+    )
+
+
+def test_seg_coverage_multiple_conflicting_frames_409(client):
+    # 两帧各自多源冲突：同一次 409 按帧号汇总全部冲突 UID
+    detail = _conflict(client, {
+        "ct1.dcm": _ct_image_bytes(CT1_SOP),
+        "ct2.dcm": _ct_image_bytes(CT2_SOP),
+        "seg.dcm": _seg_bytes(
+            frames=[
+                _fg_item_multi(1, [[CT1_SOP], [CT2_SOP]]),
+                _fg_item(1, CT1_SOP),
+                _fg_item_multi(2, [[CT2_SOP], [CT1_SOP]]),
+            ],
+            frames_pixels=[[0], [1], [2]],
+        ),
+    })
+    problems = [
+        p for p in detail["problems"]
+        if p["reason"] == "conflicting_source_references"
+    ]
+    assert [p["frame_index"] for p in problems] == [0, 2]
+    for p in problems:
+        assert p["source_sop_instance_uids"] == sorted(
+            [_anon(CT1_SOP), _anon(CT2_SOP)]
+        )
+
+
+def test_seg_coverage_conflict_and_missing_collected_together(client):
+    # 一帧缺引用、另一帧多源冲突：同一次 409 全部给出，不输出部分统计
+    detail = _conflict(client, {
+        "ct1.dcm": _ct_image_bytes(CT1_SOP),
+        "ct2.dcm": _ct_image_bytes(CT2_SOP),
+        "seg.dcm": _seg_bytes(
+            frames=[
+                _fg_item(1, _ABSENT),
+                _fg_item_multi(1, [[CT1_SOP], [CT2_SOP]]),
+            ],
+            frames_pixels=[[0], [1]],
+        ),
+    })
+    reasons = {p["reason"] for p in detail["problems"]}
+    assert "missing_source_reference" in reasons
+    assert "conflicting_source_references" in reasons
 
 
 def test_seg_coverage_source_not_in_output_409(client):

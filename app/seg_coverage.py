@@ -11,10 +11,12 @@
   Explicit VR Big Endian）、1-bit 位深
   （BitsAllocated=BitsStored=1、HighBit=0）；
 * 逐帧读取 ``PerFrameFunctionalGroupsSequence[i]``：
-  ``SegmentIdentificationSequence[0].ReferencedSegmentNumber`` 给出段号，
-  ``DerivationImageSequence[0].SourceImageSequence[0].ReferencedSOPInstanceUID``
-  给出源图像的匿名 SOP UID（匿名化已把序列内引用与源实例一致重写，
-  因此可直接与任务成功输出对齐）；
+  ``SegmentIdentificationSequence[0].ReferencedSegmentNumber`` 给出段号；
+  遍历**所有** ``DerivationImageSequence`` 条目及其
+  ``SourceImageSequence`` 条目的 ``ReferencedSOPInstanceUID``，
+  按匿名 SOP UID 去重后必须**恰有一个**唯一 UID 才作为该帧的源图像
+  （匿名化已把序列内引用与源实例一致重写，因此可直接与任务成功输出对齐；
+  只读首个条目会把一帧的多源引用静默归给首张图像，属于错误覆盖率）；
 * 源图像必须在任务成功输出中**唯一**，且其 Rows/Columns 与 SEG 掩码一致；
 * 解码 1-bit 掩码，同一（源图像, 段号）的多帧逐像素取**并集**，
   统计前景像素数、图像像素数（源图像 Rows × Columns）与覆盖率，
@@ -33,9 +35,10 @@
 * NumberOfFrames 缺失/非法（``invalid_number_of_frames``）、
   PerFrameFunctionalGroupsSequence 缺失或条目数与声明帧数不符
   （``frame_count_mismatch``）；
-* 帧缺少有效 ReferencedSegmentNumber（``missing_segment_number``）或缺少
+* 帧缺少有效 ReferencedSegmentNumber（``missing_segment_number``）、缺少
   DerivationImageSequence/SourceImageSequence 引用
-  （``missing_source_reference``）；
+  （``missing_source_reference``），或一帧的去重引用指向**多个**不同的
+  源图像匿名 SOP UID（``conflicting_source_references``，附冲突 UID 列表）；
 * 引用的源图像不在任务成功输出中（``source_not_in_output``）、对应多份输出
   （``source_ambiguous_output``）、磁盘缺失（``source_output_missing``）、
   不可读或缺少有效尺寸（``source_unreadable``）、尺寸与掩码不一致
@@ -83,6 +86,7 @@ REASON_MISSING_PIXEL_DATA = "missing_pixel_data"
 REASON_PIXEL_DECODE_FAILED = "pixel_decode_failed"
 REASON_MISSING_SEGMENT_NUMBER = "missing_segment_number"
 REASON_MISSING_SOURCE_REFERENCE = "missing_source_reference"
+REASON_CONFLICTING_SOURCE_REFERENCES = "conflicting_source_references"
 REASON_SOURCE_NOT_IN_OUTPUT = "source_not_in_output"
 REASON_SOURCE_AMBIGUOUS_OUTPUT = "source_ambiguous_output"
 REASON_SOURCE_OUTPUT_MISSING = "source_output_missing"
@@ -183,17 +187,29 @@ def _frame_segment_number(fg_item) -> Optional[int]:
     return _positive_int(getattr(seq[0], "ReferencedSegmentNumber", None))
 
 
-def _frame_source_uid(fg_item) -> Optional[str]:
-    """逐帧功能组 -> DerivationImageSequence[0] -> SourceImageSequence[0]
-    -> ReferencedSOPInstanceUID（匿名化后已与源实例输出一致）。"""
+def _frame_source_uids(fg_item) -> list[str]:
+    """逐帧功能组 -> 所有 DerivationImageSequence 条目及其 SourceImageSequence
+    条目 -> ReferencedSOPInstanceUID，按匿名 SOP UID 去重、排序后返回。
+
+    匿名化已把序列内引用与源实例一致重写。一帧去重后仍指向多个不同 UID 时
+    无法确定唯一源图像（只读首个条目会把多源引用静默归给首张图像），
+    由调用方按冲突处理；空列表表示帧缺少有效引用。
+    """
+    uids: set[str] = set()
     deriv = getattr(fg_item, "DerivationImageSequence", None)
     if not deriv:
-        return None
-    src = getattr(deriv[0], "SourceImageSequence", None)
-    if not src:
-        return None
-    uid = str(getattr(src[0], "ReferencedSOPInstanceUID", "") or "").strip()
-    return uid or None
+        return []
+    for deriv_item in deriv:
+        src = getattr(deriv_item, "SourceImageSequence", None)
+        if not src:
+            continue
+        for src_item in src:
+            uid = str(
+                getattr(src_item, "ReferencedSOPInstanceUID", "") or ""
+            ).strip()
+            if uid:
+                uids.add(uid)
+    return sorted(uids)
 
 
 # --------------------------------------------------------------------------- #
@@ -527,8 +543,8 @@ def analyze_seg_coverage(job, sop_uid: str) -> dict:
                     "SegmentIdentificationSequence/ReferencedSegmentNumber"
                 ),
             })
-        source_uid = _frame_source_uid(fg_item)
-        if source_uid is None:
+        source_uids = _frame_source_uids(fg_item)
+        if not source_uids:
             problems.append({
                 **base,
                 "frame_index": frame_index,
@@ -538,8 +554,20 @@ def analyze_seg_coverage(job, sop_uid: str) -> dict:
                     "SourceImageSequence 的 ReferencedSOPInstanceUID 引用"
                 ),
             })
-        if seg_num is not None and source_uid is not None:
-            frame_refs.append((frame_index, seg_num, source_uid))
+        elif len(source_uids) > 1:
+            problems.append({
+                **base,
+                "frame_index": frame_index,
+                "reason": REASON_CONFLICTING_SOURCE_REFERENCES,
+                "source_sop_instance_uids": source_uids,
+                "message": (
+                    f"帧 {frame_index} 的 DerivationImageSequence/"
+                    f"SourceImageSequence 去重后仍引用 {len(source_uids)} 个"
+                    "不同的源图像匿名 SOP UID，无法确定唯一源图像"
+                ),
+            })
+        if seg_num is not None and len(source_uids) == 1:
+            frame_refs.append((frame_index, seg_num, source_uids[0]))
 
     # ---- 解析被引用源图像（唯一、可读、尺寸一致） -------------------------- #
     index: dict[str, list[FileReport]] = {}
@@ -573,7 +601,7 @@ def analyze_seg_coverage(job, sop_uid: str) -> dict:
         raise SegCoverageError(
             "SEG_COVERAGE_CONFLICT",
             409,
-            "SEG 帧引用缺失/歧义或源图像尺寸不一致，"
+            "SEG 帧引用缺失/多源冲突/歧义或源图像尺寸不一致，"
             "无法给出完整的分割覆盖率统计（不输出部分统计）",
             sop_uid=sop_uid,
             extra={"conflict_count": len(problems)},

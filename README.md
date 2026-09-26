@@ -86,7 +86,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/jobs/{job_id}/series/{series_instance_uid}/kvp` | 按**匿名 SeriesInstanceUID** 统计 CT 管电压（KVP）逐帧分布：各电压帧数、缺失帧数与按匿名 SOP UID 排列的逐实例明细，便于发现同系列混用扫描参数 |
 | `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/preview.png` | 按**匿名 SOPInstanceUID** 返回实例影像的 8 位灰度 **PNG 预览**（未压缩、单帧、8/16 位 MONOCHROME1/2），供人工核对影像内容 |
 | `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/dose-events` | 按**匿名 SOPInstanceUID** 解析 **X-Ray Radiation Dose SR**：递归遍历 ContentSequence，按 DCM 编码的 CT 照射事件容器提取逐事件 CTDIvol（mGy）/ DLP（mGy·cm）并给出事件 DLP 合计；事件数据缺项/重复/非法/单位不符返回 `409` |
-| `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/seg-coverage` | 按**匿名 SOPInstanceUID** 统计**未压缩 BINARY SEG** 的分割覆盖率：逐帧用 `ReferencedSegmentNumber` 与 `DerivationImageSequence/SourceImageSequence` 的匿名引用关联任务内唯一源图像，同（源图像, 段号）多帧 1-bit 掩码逐像素并集，返回前景像素数/图像像素数/覆盖率；引用缺失/歧义、尺寸不一致、帧数或像素数据异常返回 `409` |
+| `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/seg-coverage` | 按**匿名 SOPInstanceUID** 统计**未压缩 BINARY SEG** 的分割覆盖率：逐帧用 `ReferencedSegmentNumber` 与全部 `DerivationImageSequence/SourceImageSequence` 条目的匿名引用（按 UID 去重，须恰有一个）关联任务内唯一源图像，同（源图像, 段号）多帧 1-bit 掩码逐像素并集，返回前景像素数/图像像素数/覆盖率；引用缺失/一帧多源冲突/歧义、尺寸不一致、帧数或像素数据异常返回 `409` |
 | `GET` | `/health` | 健康检查 |
 
 ### 表单参数（`POST /jobs`）
@@ -820,10 +820,12 @@ else:
 **统计规则**：
 
 1. 逐帧读取 `PerFrameFunctionalGroupsSequence[i]`：
-   `SegmentIdentificationSequence[0].ReferencedSegmentNumber` 给出**段号**，
-   `DerivationImageSequence[0].SourceImageSequence[0].ReferencedSOPInstanceUID`
-   给出**源图像的匿名 SOP UID**（匿名化已把序列内引用与源实例一致重写，
-   因此可直接对齐任务成功输出）；
+   `SegmentIdentificationSequence[0].ReferencedSegmentNumber` 给出**段号**；
+   遍历**所有** `DerivationImageSequence` 条目及其 `SourceImageSequence`
+   条目的 `ReferencedSOPInstanceUID`，按匿名 SOP UID 去重后必须**恰有一个**
+   唯一 UID 才作为该帧源图像（匿名化已把序列内引用与源实例一致重写，
+   因此可直接对齐任务成功输出）。一帧引用多个不同源图像时**不静默取首个**，
+   而是按冲突返回 `409`（见下表 `conflicting_source_references`）；
 2. 每个被引用的源图像必须**唯一**对应任务内一份成功输出，且其
    `Rows/Columns` 与 SEG 掩码一致（只读取源图像像素之前的标签，不解码源像素）；
 3. 解码 1-bit 掩码，把**同一（源图像, 段号）** 的多帧**逐像素取并集**
@@ -877,7 +879,8 @@ curl -f "http://localhost:8000/jobs/$JOB_ID/instances/$SEG_UID/seg-coverage" | p
 出现以下任一情况时接口**不输出部分统计**，而是返回 `409`
 （`detail.code = SEG_COVERAGE_CONFLICT`），在 `detail.problems[]` 中
 **一次性列出全部问题**（每条都带匿名 SEG SOP UID，帧级问题附 `frame_index`，
-源图像问题附匿名 `source_sop_instance_uid`，绝不回显原始 UID）：
+源图像问题附匿名 `source_sop_instance_uid`，一帧多源冲突附
+`source_sop_instance_uids` 冲突列表，绝不回显原始 UID）：
 
 | `reason` | 触发条件 |
 | --- | --- |
@@ -893,6 +896,7 @@ curl -f "http://localhost:8000/jobs/$JOB_ID/instances/$SEG_UID/seg-coverage" | p
 | `pixel_decode_failed` | 像素数据截断或与元数据不符，1-bit 掩码无法解码 |
 | `missing_segment_number` | 帧缺少有效 `ReferencedSegmentNumber` |
 | `missing_source_reference` | 帧缺少 `DerivationImageSequence`/`SourceImageSequence` 引用 |
+| `conflicting_source_references` | 一帧的去重引用指向多个不同源图像匿名 SOP UID（`source_sop_instance_uids` 列出全部冲突 UID），无法确定唯一源图像 |
 | `source_not_in_output` | 帧引用的源图像匿名 SOP UID 不在任务成功输出中（引用缺失） |
 | `source_ambiguous_output` | 源图像匿名 SOP UID 对应多份输出（`output_files` 列出冲突文件，引用歧义） |
 | `source_output_missing` | 源图像输出文件在任务目录中已不存在 |
@@ -1513,7 +1517,7 @@ UID 是否缺失——“标签存在但为空/空白”与“标签完全缺失
 │   ├── anonymizer.py    # 逐条目独立暂存的安全解压 + 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
 │   ├── preview.py       # 按匿名 SOP UID 从成功输出渲染单帧 8 位灰度 PNG：Rescale→VOI 窗/极值拉伸→MONOCHROME1 反相
 │   ├── dose_events.py   # 按匿名 SOP UID 解析 X-Ray Radiation Dose SR：CT 照射事件容器边界、逐事件 CTDIvol/DLP 与事件 DLP 合计
-│   ├── seg_coverage.py  # 按匿名 SOP UID 统计未压缩 BINARY SEG 覆盖率：逐帧源图像关联、同（源图像, 段号）1-bit 掩码并集
+│   ├── seg_coverage.py  # 按匿名 SOP UID 统计未压缩 BINARY SEG 覆盖率：逐帧全量源引用去重校验（一帧多源 409）、同（源图像, 段号）1-bit 掩码并集
 │   ├── dicomdir.py      # 从匿名输出重建 DICOMDIR 四级层级、稳定短 File ID、引用校验与阅片 ZIP
 │   ├── geometry.py      # 系列单帧切片几何：方向余弦叉积法线、投影排序、中位数层间距与 >1.5× 缺口标记
 │   ├── kvp.py           # 系列 CT 管电压逐帧分布：逐帧/共享功能组/顶层三级回退、各电压帧数与缺失帧数统计
@@ -1526,7 +1530,7 @@ UID 是否缺失——“标签存在但为空/空白”与“标签完全缺失
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
 │   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何/KVP/剂量事件/SEG 覆盖率错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件 / SEG 分割覆盖率 / ZIP 同名条目（308 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件 / SEG 分割覆盖率 / ZIP 同名条目（333 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
